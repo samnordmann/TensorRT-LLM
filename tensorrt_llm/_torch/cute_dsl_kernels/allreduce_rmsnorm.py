@@ -80,10 +80,22 @@ class _TwoShotRuntime:
     rmsnorm_threads_per_cta: int
 
 
+@dataclass
+class _FusedTwoShotRuntime:
+    symm_input: _SymmTensor
+    symm_output: _SymmTensor
+    launch: Callable
+    threads_per_cta: int
+
+
 _RUNTIME_CACHE: dict[tuple[int, int, int, torch.dtype], _Runtime] = {}
 _TWOSHOT_RUNTIME_CACHE: dict[
     tuple[int, int, int, torch.dtype, int, int, int, int, bool],
     _TwoShotRuntime,
+] = {}
+_FUSED_TWOSHOT_RUNTIME_CACHE: dict[
+    tuple[int, int, int, torch.dtype, int, int, int],
+    _FusedTwoShotRuntime,
 ] = {}
 _REGISTERED_SYMM_INPUTS: dict[tuple[int, int, int, torch.dtype], _SymmTensor] = {}
 
@@ -764,6 +776,178 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
 
+    class _FusedTwoShotBf16Launcher:
+        def __init__(
+            self,
+            rows: int,
+            hidden_size: int,
+            threads_per_cta: int,
+            world_size: int,
+            rank: int,
+        ):
+            self.rows = rows
+            self.hidden_size = hidden_size
+            self.threads_per_cta = threads_per_cta
+            self.world_size = world_size
+            self.rank = rank
+            self.vec_chunks = hidden_size // (threads_per_cta * 8)
+            self.numel = rows * hidden_size
+
+        @cute.kernel
+        def kernel(
+            self,
+            mc_in: cute.Tensor,
+            uc_residual: cute.Tensor,
+            uc_weight: cute.Tensor,
+            mc_output: cute.Tensor,
+            eps: Float32,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            row, _, _ = cute.arch.block_idx()
+
+            if row % self.world_size == self.rank:
+                frag_h = cute.make_rmem_tensor((self.vec_chunks, 8), Float32)
+                sum_sq = Float32(0.0)
+
+                for c in cutlass.range_constexpr(self.vec_chunks):
+                    col = c * self.threads_per_cta * 8 + tidx * 8
+                    offset = row * self.hidden_size + col
+
+                    r0, r1, r2, r3 = utils.distributed.multimem_ld_reduce_8xbf16(
+                        mc_in.iterator + offset
+                    )
+                    b0, b1 = _i32_to_bf16_pair(r0)
+                    b2, b3 = _i32_to_bf16_pair(r1)
+                    b4, b5 = _i32_to_bf16_pair(r2)
+                    b6, b7 = _i32_to_bf16_pair(r3)
+
+                    res_r0, res_r1, res_r2, res_r3 = _ld_global_8xbf16(
+                        uc_residual.iterator + offset
+                    )
+                    res0, res1 = _i32_to_bf16_pair(res_r0)
+                    res2, res3 = _i32_to_bf16_pair(res_r1)
+                    res4, res5 = _i32_to_bf16_pair(res_r2)
+                    res6, res7 = _i32_to_bf16_pair(res_r3)
+
+                    h0 = Float32(b0) + Float32(res0)
+                    h1 = Float32(b1) + Float32(res1)
+                    h2 = Float32(b2) + Float32(res2)
+                    h3 = Float32(b3) + Float32(res3)
+                    h4 = Float32(b4) + Float32(res4)
+                    h5 = Float32(b5) + Float32(res5)
+                    h6 = Float32(b6) + Float32(res6)
+                    h7 = Float32(b7) + Float32(res7)
+
+                    _multimem_st_8xbf16(
+                        mc_output.iterator + offset,
+                        _f32x2_to_bf16x2(h0, h1),
+                        _f32x2_to_bf16x2(h2, h3),
+                        _f32x2_to_bf16x2(h4, h5),
+                        _f32x2_to_bf16x2(h6, h7),
+                    )
+
+                    sum_sq = (
+                        sum_sq
+                        + h0 * h0
+                        + h1 * h1
+                        + h2 * h2
+                        + h3 * h3
+                        + h4 * h4
+                        + h5 * h5
+                        + h6 * h6
+                        + h7 * h7
+                    )
+
+                    frag_h[c, 0] = h0
+                    frag_h[c, 1] = h1
+                    frag_h[c, 2] = h2
+                    frag_h[c, 3] = h3
+                    frag_h[c, 4] = h4
+                    frag_h[c, 5] = h5
+                    frag_h[c, 6] = h6
+                    frag_h[c, 7] = h7
+
+                lane_idx = cute.arch.lane_idx()
+                warp_idx = cute.arch.warp_idx()
+                num_warps = self.threads_per_cta // 32
+
+                sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+                smem_ptr = cute.arch.alloc_smem(Float32, num_warps + 1)
+                smem = cute.make_tensor(smem_ptr, cute.make_layout((num_warps + 1,)))
+
+                if lane_idx == 0:
+                    smem[warp_idx] = sum_sq
+                cute.arch.barrier()
+
+                if warp_idx == 0:
+                    part = Float32(0.0)
+                    if lane_idx < num_warps:
+                        part = smem[lane_idx]
+                    part = cute.arch.warp_reduction_sum(part)
+                    if lane_idx == 0:
+                        smem[num_warps] = cute.math.rsqrt(
+                            part / Float32(self.hidden_size) + eps,
+                            fastmath=True,
+                        )
+                cute.arch.barrier()
+
+                inv_rms = smem[num_warps]
+
+                for c in cutlass.range_constexpr(self.vec_chunks):
+                    col = c * self.threads_per_cta * 8 + tidx * 8
+                    offset = row * self.hidden_size + col
+
+                    w_r0, w_r1, w_r2, w_r3 = _ld_global_8xbf16(uc_weight.iterator + col)
+                    w0, w1 = _i32_to_bf16_pair(w_r0)
+                    w2, w3 = _i32_to_bf16_pair(w_r1)
+                    w4, w5 = _i32_to_bf16_pair(w_r2)
+                    w6, w7 = _i32_to_bf16_pair(w_r3)
+
+                    y0 = frag_h[c, 0] * inv_rms * Float32(w0)
+                    y1 = frag_h[c, 1] * inv_rms * Float32(w1)
+                    y2 = frag_h[c, 2] * inv_rms * Float32(w2)
+                    y3 = frag_h[c, 3] * inv_rms * Float32(w3)
+                    y4 = frag_h[c, 4] * inv_rms * Float32(w4)
+                    y5 = frag_h[c, 5] * inv_rms * Float32(w5)
+                    y6 = frag_h[c, 6] * inv_rms * Float32(w6)
+                    y7 = frag_h[c, 7] * inv_rms * Float32(w7)
+
+                    _multimem_st_8xbf16(
+                        mc_output.iterator + self.numel + offset,
+                        _f32x2_to_bf16x2(y0, y1),
+                        _f32x2_to_bf16x2(y2, y3),
+                        _f32x2_to_bf16x2(y4, y5),
+                        _f32x2_to_bf16x2(y6, y7),
+                    )
+
+        @cute.jit
+        def __call__(
+            self,
+            mc_addr_in: Int64,
+            uc_addr_residual: Int64,
+            uc_addr_weight: Int64,
+            mc_addr_output: Int64,
+            eps: Float32,
+            stream: cuda.CUstream,
+        ):
+            mc_in = _raw_tensor_2d(mc_addr_in, BFloat16, self.rows, self.hidden_size)
+            uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
+            uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
+            mc_output = _raw_tensor_1d(mc_addr_output, BFloat16, self.numel * 2)
+
+            self.kernel(
+                mc_in,
+                uc_res,
+                uc_w,
+                mc_output,
+                eps,
+            ).launch(
+                grid=[self.rows, 1, 1],
+                block=[self.threads_per_cta, 1, 1],
+                stream=stream,
+            )
+
+
 def _make_runtime(
     input_2d: torch.Tensor,
     residual_2d: torch.Tensor,
@@ -914,6 +1098,79 @@ def _get_twoshot_runtime(
     return runtime
 
 
+def _make_fused_twoshot_runtime(
+    input_2d: torch.Tensor,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    threads_per_cta: int,
+) -> _FusedTwoShotRuntime:
+    _require_cute()
+    rows, hidden_size = input_2d.shape
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    symm_input = _alloc_symm_tensor(input_2d.numel(), input_2d.dtype)
+    symm_output = _alloc_symm_tensor(input_2d.numel() * 2, input_2d.dtype)
+    mc_addr_in = symm_input.multicast_ptr
+    mc_addr_output = symm_output.multicast_ptr
+    if mc_addr_in is None or mc_addr_output is None:
+        raise NotImplementedError("symmetric memory multicast pointer is unavailable")
+
+    launcher = _FusedTwoShotBf16Launcher(
+        rows,
+        hidden_size,
+        threads_per_cta,
+        world_size,
+        rank,
+    )
+    launch = cute.compile(
+        launcher,
+        Int64(mc_addr_in),
+        Int64(residual_2d.data_ptr()),
+        Int64(weight.data_ptr()),
+        Int64(mc_addr_output),
+        Float32(eps),
+        make_fake_stream(),
+    )
+
+    return _FusedTwoShotRuntime(
+        symm_input=symm_input,
+        symm_output=symm_output,
+        launch=launch,
+        threads_per_cta=threads_per_cta,
+    )
+
+
+def _get_fused_twoshot_runtime(
+    input_2d: torch.Tensor,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    threads_per_cta: int,
+) -> _FusedTwoShotRuntime:
+    key = (
+        torch.cuda.current_device(),
+        input_2d.shape[0],
+        input_2d.shape[1],
+        input_2d.dtype,
+        dist.get_world_size(),
+        dist.get_rank(),
+        threads_per_cta,
+    )
+    runtime = _FUSED_TWOSHOT_RUNTIME_CACHE.get(key)
+    if runtime is None:
+        runtime = _make_fused_twoshot_runtime(
+            input_2d,
+            residual_2d,
+            weight,
+            eps,
+            threads_per_cta,
+        )
+        _FUSED_TWOSHOT_RUNTIME_CACHE[key] = runtime
+    return runtime
+
+
 def _launch_runtime(
     runtime: _Runtime,
     mc_addr: int,
@@ -961,6 +1218,24 @@ def _launch_twoshot_rmsnorm(
         Int64(weight.data_ptr()),
         Int64(h_out.data_ptr()),
         Int64(y_out.data_ptr()),
+        Float32(eps),
+        _current_cu_stream(),
+    )
+
+
+def _launch_fused_twoshot(
+    runtime: _FusedTwoShotRuntime,
+    mc_addr_in: int,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    mc_addr_output: int,
+    eps: float,
+) -> None:
+    runtime.launch(
+        Int64(mc_addr_in),
+        Int64(residual_2d.data_ptr()),
+        Int64(weight.data_ptr()),
+        Int64(mc_addr_output),
         Float32(eps),
         _current_cu_stream(),
     )
@@ -1306,6 +1581,151 @@ class FusedAllreduceResidualRmsnormBf16TwoShotContext:
     __call__ = forward
 
 
+class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
+    """Single-kernel row-owner variant of the two-shot CuTe POC.
+
+    One rank owns each row, performs the full ``multimem.ld_reduce`` +
+    residual + RMSNorm computation for that row, and multicast-stores final
+    ``h`` and ``y`` into a symmetric output buffer. This keeps the operation in
+    one CUDA kernel, but assumes residual/weight are replicated across ranks.
+    """
+
+    def __init__(
+        self,
+        reference_input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        sync_mode: str = _SYNC_MODE_INTERNAL,
+    ):
+        _require_cute()
+        sync_mode = _validate_sync_mode(sync_mode)
+        hidden_size = _check_common_inputs(reference_input, reference_input, weight)
+
+        self.shape = reference_input.shape
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.sync_mode = sync_mode
+        self.weight = weight.contiguous()
+
+        reference_2d = reference_input.contiguous().view(-1, hidden_size)
+        output_reference = torch.empty(
+            (2, reference_2d.numel()),
+            dtype=reference_2d.dtype,
+            device=reference_2d.device,
+        )
+        self.input = allocate_symmetric_tensor_like(reference_2d).view_as(reference_2d)
+        self.output = allocate_symmetric_tensor_like(output_reference).view(2, reference_2d.numel())
+        self.input_2d = self.input.view(-1, hidden_size)
+        self.h_out = self.output[0].view_as(self.input_2d)
+        self.y_out = self.output[1].view_as(self.input_2d)
+
+        world_size = dist.get_world_size()
+        self.threads_per_cta = _valid_twoshot_rmsnorm_threads_per_cta(
+            reference_2d.shape[0],
+            hidden_size,
+        )
+
+        _enable_symmetric_memory()
+        cutlass.cuda.initialize_cuda_context(torch.cuda.current_device())
+        self.runtime = _get_fused_twoshot_runtime(
+            self.input_2d,
+            reference_2d,
+            self.weight,
+            eps,
+            self.threads_per_cta,
+        )
+
+        symm_input = _lookup_symmetric_input(self.input_2d)
+        symm_output = _lookup_symmetric_input(self.output.reshape(-1))
+        if symm_input is None or symm_output is None:
+            raise RuntimeError("failed to find registered symmetric buffers")
+
+        self._symm_input = symm_input
+        self._symm_output = symm_output
+        mc_addr_in = symm_input.multicast_ptr
+        mc_addr_output = symm_output.multicast_ptr
+        if mc_addr_in is None or mc_addr_output is None:
+            raise NotImplementedError("symmetric memory multicast pointer is unavailable")
+        self._mc_addr_in = mc_addr_in
+        self._mc_addr_output = mc_addr_output
+        self.world_size = world_size
+
+    @property
+    def symmetric_input(self) -> torch.Tensor:
+        return self.input.view(self.shape)
+
+    def copy_input_(self, input: torch.Tensor) -> torch.Tensor:
+        if input.shape != self.shape:
+            raise NotImplementedError("input shape must match the context shape")
+        if input.dtype != torch.bfloat16:
+            raise NotImplementedError("only bf16 input is supported")
+        self.input_2d.copy_(input.contiguous().view(-1, self.hidden_size))
+        return self.symmetric_input
+
+    def input_ready(self) -> None:
+        self._symm_input.handle.barrier()
+
+    def output_ready(self) -> None:
+        self._symm_output.handle.barrier()
+
+    def _prepare_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        if residual.shape != self.shape:
+            raise NotImplementedError("residual shape must match the context shape")
+        if residual.dtype != torch.bfloat16:
+            raise NotImplementedError("only bf16 residual is supported")
+        return residual.contiguous().view(-1, self.hidden_size)
+
+    def prepare_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        return self._prepare_residual(residual)
+
+    def launch_fused(self, residual_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _launch_fused_twoshot(
+            self.runtime,
+            self._mc_addr_in,
+            residual_2d,
+            self.weight,
+            self._mc_addr_output,
+            self.eps,
+        )
+        return self.y_out.view(self.shape), self.h_out.view(self.shape)
+
+    def make_prepared_forward(
+        self,
+        residual: torch.Tensor,
+    ) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+        residual_2d = self.prepare_residual(residual)
+        y_view = self.y_out.view(self.shape)
+        h_view = self.h_out.view(self.shape)
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            self.launch_fused(residual_2d)
+            self.output_ready()
+            return y_view, h_view
+
+        return run
+
+    def forward(
+        self,
+        residual: torch.Tensor,
+        input: torch.Tensor | None = None,
+        *,
+        sync: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if input is not None:
+            self.copy_input_(input)
+
+        residual_2d = self._prepare_residual(residual)
+        do_sync = self.sync_mode == _SYNC_MODE_INTERNAL if sync is None else sync
+        if do_sync:
+            self.input_ready()
+        outputs = self.launch_fused(residual_2d)
+        self.output_ready()
+        return outputs
+
+    __call__ = forward
+
+
 def fused_allreduce_residual_rmsnorm_bf16(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -1359,4 +1779,18 @@ def fused_allreduce_residual_rmsnorm_bf16_twoshot(
         raise NotImplementedError("CuTe two-shot allreduce RMSNorm POC is not CUDA-graph safe")
 
     context = FusedAllreduceResidualRmsnormBf16TwoShotContext(input, weight, eps)
+    return context.forward(residual, input)
+
+
+def fused_allreduce_residual_rmsnorm_bf16_fused_twoshot(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute()
+    if torch.cuda.is_current_stream_capturing():
+        raise NotImplementedError("CuTe fused two-shot allreduce RMSNorm POC is not CUDA-graph safe")
+
+    context = FusedAllreduceResidualRmsnormBf16FusedTwoShotContext(input, weight, eps)
     return context.forward(residual, input)
