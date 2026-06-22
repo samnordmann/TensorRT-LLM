@@ -190,8 +190,26 @@ def _valid_twoshot_rmsnorm_threads_per_cta(rows: int, hidden_size: int) -> int:
     return valid[-1]
 
 
-def _use_twoshot_tile_ownership() -> bool:
-    return os.environ.get("TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_TILE_OWNERSHIP") == "1"
+def _valid_fused_twoshot_threads_per_cta(rows: int, hidden_size: int) -> int:
+    override = _twoshot_threads_per_cta_override(
+        "TRTLLM_CUTE_AR_RMSNORM_FUSED_TWOSHOT_THREADS_PER_CTA"
+    )
+    valid = _valid_threads_per_cta_values(hidden_size)
+    if not valid:
+        raise NotImplementedError(f"hidden_size={hidden_size} is not supported")
+    if override is not None:
+        return _validate_threads_per_cta_override(hidden_size, override, valid)
+
+    if rows >= 512 and hidden_size >= 8192 and 256 in valid:
+        return 256
+    return _valid_twoshot_rmsnorm_threads_per_cta(rows, hidden_size)
+
+
+def _use_twoshot_tile_ownership(rows: int, world_size: int) -> bool:
+    override = os.environ.get("TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_TILE_OWNERSHIP")
+    if override is not None:
+        return override == "1"
+    return rows < world_size
 
 
 def _enable_symmetric_memory() -> None:
@@ -370,7 +388,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 Int32(r2).ir_value(loc=loc, ip=ip),
                 Int32(r3).ir_value(loc=loc, ip=ip),
             ],
-            "multimem.st.global.v4.bf16x2 [$0], {$1,$2,$3,$4};",
+            "multimem.st.global.v4.f32 [$0], {$1,$2,$3,$4};",
             "l,r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
@@ -380,7 +398,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
 
     class _FusedArRmsnormBf16Launcher:
-        def __init__(self, rows: int, hidden_size: int, threads_per_cta: int):
+        def __init__(
+            self,
+            rows: int,
+            hidden_size: int,
+            threads_per_cta: int,
+        ):
             self.rows = rows
             self.hidden_size = hidden_size
             self.threads_per_cta = threads_per_cta
@@ -560,6 +583,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.rank = rank
             self.tile_ownership = tile_ownership
             self.vec_chunks = hidden_size // (threads_per_cta * 8)
+            self.total_tiles = rows * self.vec_chunks
+            self.owned_rows = max(
+                1,
+                (rows + world_size - 1 - rank) // world_size if rank < rows else 0,
+            )
+            self.owned_tiles = max(
+                1,
+                (self.total_tiles + world_size - 1 - rank) // world_size
+                if rank < self.total_tiles
+                else 0,
+            )
 
         @cute.kernel
         def kernel(
@@ -568,11 +602,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mc_reduced: cute.Tensor,
         ):
             tidx, _, _ = cute.arch.thread_idx()
-            row, chunk, _ = cute.arch.block_idx()
+            owner_idx, _, _ = cute.arch.block_idx()
 
             if self.tile_ownership:
-                tile_id = row * self.vec_chunks + chunk
-                if tile_id % self.world_size == self.rank:
+                tile_id = owner_idx * self.world_size + self.rank
+                if tile_id < self.total_tiles:
+                    row = tile_id // self.vec_chunks
+                    chunk = tile_id % self.vec_chunks
                     col = chunk * self.threads_per_cta * 8 + tidx * 8
                     offset = row * self.hidden_size + col
 
@@ -581,7 +617,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )
                     _multimem_st_8xbf16(mc_reduced.iterator + offset, r0, r1, r2, r3)
             else:
-                if row % self.world_size == self.rank:
+                row = owner_idx * self.world_size + self.rank
+                if row < self.rows:
                     for c in cutlass.range_constexpr(self.vec_chunks):
                         col = c * self.threads_per_cta * 8 + tidx * 8
                         offset = row * self.hidden_size + col
@@ -604,13 +641,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
             self.kernel(mc_in, mc_reduced).launch(
-                grid=[self.rows, self.vec_chunks if self.tile_ownership else 1, 1],
+                grid=[self.owned_tiles if self.tile_ownership else self.owned_rows, 1, 1],
                 block=[self.threads_per_cta, 1, 1],
                 stream=stream,
             )
 
     class _TwoShotRmsnormBf16Launcher:
-        def __init__(self, rows: int, hidden_size: int, threads_per_cta: int):
+        def __init__(
+            self,
+            rows: int,
+            hidden_size: int,
+            threads_per_cta: int,
+        ):
             self.rows = rows
             self.hidden_size = hidden_size
             self.threads_per_cta = threads_per_cta
@@ -792,6 +834,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.rank = rank
             self.vec_chunks = hidden_size // (threads_per_cta * 8)
             self.numel = rows * hidden_size
+            self.owned_rows = max(
+                1,
+                (rows + world_size - 1 - rank) // world_size if rank < rows else 0,
+            )
 
         @cute.kernel
         def kernel(
@@ -803,9 +849,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             eps: Float32,
         ):
             tidx, _, _ = cute.arch.thread_idx()
-            row, _, _ = cute.arch.block_idx()
+            owner_idx, _, _ = cute.arch.block_idx()
 
-            if row % self.world_size == self.rank:
+            row = owner_idx * self.world_size + self.rank
+            if row < self.rows:
                 frag_h = cute.make_rmem_tensor((self.vec_chunks, 8), Float32)
                 sum_sq = Float32(0.0)
 
@@ -942,7 +989,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mc_output,
                 eps,
             ).launch(
-                grid=[self.rows, 1, 1],
+                grid=[self.owned_rows, 1, 1],
                 block=[self.threads_per_cta, 1, 1],
                 stream=stream,
             )
@@ -973,7 +1020,11 @@ def _make_runtime(
         Float32(eps),
         make_fake_stream(),
     )
-    launcher = _FusedArRmsnormBf16Launcher(rows, hidden_size, threads_per_cta)
+    launcher = _FusedArRmsnormBf16Launcher(
+        rows,
+        hidden_size,
+        threads_per_cta,
+    )
     launch = cute.compile(launcher, *compile_args)
     return _Runtime(
         symm_input=symm_input,
@@ -997,7 +1048,13 @@ def _get_runtime(
     )
     runtime = _RUNTIME_CACHE.get(key)
     if runtime is None or runtime.threads_per_cta != threads_per_cta:
-        runtime = _make_runtime(input_2d, residual_2d, weight, eps, threads_per_cta)
+        runtime = _make_runtime(
+            input_2d,
+            residual_2d,
+            weight,
+            eps,
+            threads_per_cta,
+        )
         _RUNTIME_CACHE[key] = runtime
     return runtime
 
@@ -1041,7 +1098,11 @@ def _make_twoshot_runtime(
         make_fake_stream(),
     )
 
-    rmsnorm_launcher = _TwoShotRmsnormBf16Launcher(rows, hidden_size, rmsnorm_threads_per_cta)
+    rmsnorm_launcher = _TwoShotRmsnormBf16Launcher(
+        rows,
+        hidden_size,
+        rmsnorm_threads_per_cta,
+    )
     rmsnorm_launch = cute.compile(
         rmsnorm_launcher,
         Int64(symm_reduced.tensor.data_ptr()),
@@ -1463,7 +1524,9 @@ class FusedAllreduceResidualRmsnormBf16TwoShotContext:
             hidden_size,
         )
         self.threads_per_cta = self.rmsnorm_threads_per_cta
-        self.twoshot_tile_ownership = _use_twoshot_tile_ownership()
+        self.twoshot_tile_ownership = _use_twoshot_tile_ownership(
+            reference_2d.shape[0], world_size
+        )
 
         _enable_symmetric_memory()
         cutlass.cuda.initialize_cuda_context(torch.cuda.current_device())
@@ -1621,7 +1684,7 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
         self.y_out = self.output[1].view_as(self.input_2d)
 
         world_size = dist.get_world_size()
-        self.threads_per_cta = _valid_twoshot_rmsnorm_threads_per_cta(
+        self.threads_per_cta = _valid_fused_twoshot_threads_per_cta(
             reference_2d.shape[0],
             hidden_size,
         )
