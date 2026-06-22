@@ -84,6 +84,7 @@ class _TwoShotRuntime:
 class _FusedTwoShotRuntime:
     symm_input: _SymmTensor
     symm_output: _SymmTensor
+    symm_sync: _SymmTensor | None
     launch: Callable
     threads_per_cta: int
 
@@ -94,7 +95,7 @@ _TWOSHOT_RUNTIME_CACHE: dict[
     _TwoShotRuntime,
 ] = {}
 _FUSED_TWOSHOT_RUNTIME_CACHE: dict[
-    tuple[int, int, int, torch.dtype, int, int, int],
+    tuple[int, int, int, torch.dtype, int, int, int, bool],
     _FusedTwoShotRuntime,
 ] = {}
 _REGISTERED_SYMM_INPUTS: dict[tuple[int, int, int, torch.dtype], _SymmTensor] = {}
@@ -390,6 +391,87 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ],
             "multimem.st.global.v4.f32 [$0], {$1,$2,$3,$4};",
             "l,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_global_i32_volatile(uc_ptr: cute.Pointer, *, loc=None, ip=None):
+        ptr_i64 = llvm.ptrtoint(T.i64(), uc_ptr.llvm_ptr, loc=loc, ip=ip)
+        result = llvm.inline_asm(
+            T.i32(),
+            [ptr_i64],
+            "ld.volatile.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        return Int32(result)
+
+    @dsl_user_op
+    def _atom_global_add_i32(uc_ptr: cute.Pointer, value, *, loc=None, ip=None):
+        ptr_i64 = llvm.ptrtoint(T.i64(), uc_ptr.llvm_ptr, loc=loc, ip=ip)
+        result = llvm.inline_asm(
+            T.i32(),
+            [
+                ptr_i64,
+                Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        return Int32(result)
+
+    @dsl_user_op
+    def _multimem_st_i32(mc_ptr: cute.Pointer, value, *, loc=None, ip=None):
+        ptr_i64 = llvm.ptrtoint(T.i64(), mc_ptr.llvm_ptr, loc=loc, ip=ip)
+        llvm.inline_asm(
+            None,
+            [
+                ptr_i64,
+                Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "multimem.st.global.u32 [$0], $1;",
+            "l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _fence_acq_rel_sys(*, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [],
+            "fence.acq_rel.sys;",
+            "",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _spin_pause(*, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [],
+            "",
+            "",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -826,18 +908,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             threads_per_cta: int,
             world_size: int,
             rank: int,
+            device_sync: bool,
         ):
             self.rows = rows
             self.hidden_size = hidden_size
             self.threads_per_cta = threads_per_cta
             self.world_size = world_size
             self.rank = rank
+            self.device_sync = device_sync
             self.vec_chunks = hidden_size // (threads_per_cta * 8)
             self.numel = rows * hidden_size
-            self.owned_rows = max(
-                1,
-                (rows + world_size - 1 - rank) // world_size if rank < rows else 0,
+            self.real_owned_rows = (
+                (rows + world_size - 1 - rank) // world_size if rank < rows else 0
             )
+            self.owned_rows = max(1, self.real_owned_rows)
+            self.grid_rows = self.owned_rows + 1 if device_sync else self.owned_rows
 
         @cute.kernel
         def kernel(
@@ -846,13 +931,52 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_residual: cute.Tensor,
             uc_weight: cute.Tensor,
             mc_output: cute.Tensor,
+            uc_sync: cute.Tensor,
+            mc_sync: cute.Tensor,
             eps: Float32,
         ):
             tidx, _, _ = cute.arch.thread_idx()
             owner_idx, _, _ = cute.arch.block_idx()
 
-            row = owner_idx * self.world_size + self.rank
-            if row < self.rows:
+            if self.device_sync and owner_idx == self.owned_rows:
+                if tidx == 0:
+                    epoch = _atom_global_add_i32(uc_sync.iterator + 1, Int32(1)) + Int32(1)
+                    target = epoch * Int32(self.real_owned_rows)
+                    while _ld_global_i32_volatile(uc_sync.iterator + 0) < target:
+                        _spin_pause()
+
+                    _fence_acq_rel_sys()
+                    _multimem_st_i32(mc_sync.iterator + 2 + self.rank, epoch)
+                    for peer in cutlass.range_constexpr(self.world_size):
+                        while _ld_global_i32_volatile(uc_sync.iterator + 2 + peer) < epoch:
+                            _spin_pause()
+            else:
+                row = owner_idx * self.world_size + self.rank
+                if owner_idx < self.real_owned_rows:
+                    self._compute_row(
+                        tidx,
+                        row,
+                        mc_in,
+                        uc_residual,
+                        uc_weight,
+                        mc_output,
+                        eps,
+                    )
+                    if self.device_sync and tidx == 0:
+                        _fence_acq_rel_sys()
+                        _atom_global_add_i32(uc_sync.iterator + 0, Int32(1))
+
+        @cute.jit
+        def _compute_row(
+            self,
+            tidx,
+            row,
+            mc_in: cute.Tensor,
+            uc_residual: cute.Tensor,
+            uc_weight: cute.Tensor,
+            mc_output: cute.Tensor,
+            eps: Float32,
+        ):
                 frag_h = cute.make_rmem_tensor((self.vec_chunks, 8), Float32)
                 sum_sq = Float32(0.0)
 
@@ -974,6 +1098,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_addr_residual: Int64,
             uc_addr_weight: Int64,
             mc_addr_output: Int64,
+            uc_addr_sync: Int64,
+            mc_addr_sync: Int64,
             eps: Float32,
             stream: cuda.CUstream,
         ):
@@ -981,15 +1107,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
             uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
             mc_output = _raw_tensor_1d(mc_addr_output, BFloat16, self.numel * 2)
+            uc_sync = _raw_tensor_1d(uc_addr_sync, Int32, self.world_size + 2)
+            mc_sync = _raw_tensor_1d(mc_addr_sync, Int32, self.world_size + 2)
 
             self.kernel(
                 mc_in,
                 uc_res,
                 uc_w,
                 mc_output,
+                uc_sync,
+                mc_sync,
                 eps,
             ).launch(
-                grid=[self.owned_rows, 1, 1],
+                grid=[self.grid_rows, 1, 1],
                 block=[self.threads_per_cta, 1, 1],
                 stream=stream,
             )
@@ -1165,6 +1295,7 @@ def _make_fused_twoshot_runtime(
     weight: torch.Tensor,
     eps: float,
     threads_per_cta: int,
+    device_sync: bool,
 ) -> _FusedTwoShotRuntime:
     _require_cute()
     rows, hidden_size = input_2d.shape
@@ -1173,9 +1304,11 @@ def _make_fused_twoshot_runtime(
 
     symm_input = _alloc_symm_tensor(input_2d.numel(), input_2d.dtype)
     symm_output = _alloc_symm_tensor(input_2d.numel() * 2, input_2d.dtype)
+    symm_sync = _alloc_symm_tensor(world_size + 2, torch.int32)
     mc_addr_in = symm_input.multicast_ptr
     mc_addr_output = symm_output.multicast_ptr
-    if mc_addr_in is None or mc_addr_output is None:
+    mc_addr_sync = symm_sync.multicast_ptr
+    if mc_addr_in is None or mc_addr_output is None or mc_addr_sync is None:
         raise NotImplementedError("symmetric memory multicast pointer is unavailable")
 
     launcher = _FusedTwoShotBf16Launcher(
@@ -1184,6 +1317,7 @@ def _make_fused_twoshot_runtime(
         threads_per_cta,
         world_size,
         rank,
+        device_sync,
     )
     launch = cute.compile(
         launcher,
@@ -1191,6 +1325,8 @@ def _make_fused_twoshot_runtime(
         Int64(residual_2d.data_ptr()),
         Int64(weight.data_ptr()),
         Int64(mc_addr_output),
+        Int64(symm_sync.tensor.data_ptr()),
+        Int64(mc_addr_sync),
         Float32(eps),
         make_fake_stream(),
     )
@@ -1198,6 +1334,7 @@ def _make_fused_twoshot_runtime(
     return _FusedTwoShotRuntime(
         symm_input=symm_input,
         symm_output=symm_output,
+        symm_sync=symm_sync,
         launch=launch,
         threads_per_cta=threads_per_cta,
     )
@@ -1209,6 +1346,7 @@ def _get_fused_twoshot_runtime(
     weight: torch.Tensor,
     eps: float,
     threads_per_cta: int,
+    device_sync: bool,
 ) -> _FusedTwoShotRuntime:
     key = (
         torch.cuda.current_device(),
@@ -1218,6 +1356,7 @@ def _get_fused_twoshot_runtime(
         dist.get_world_size(),
         dist.get_rank(),
         threads_per_cta,
+        device_sync,
     )
     runtime = _FUSED_TWOSHOT_RUNTIME_CACHE.get(key)
     if runtime is None:
@@ -1227,6 +1366,7 @@ def _get_fused_twoshot_runtime(
             weight,
             eps,
             threads_per_cta,
+            device_sync,
         )
         _FUSED_TWOSHOT_RUNTIME_CACHE[key] = runtime
     return runtime
@@ -1290,6 +1430,8 @@ def _launch_fused_twoshot(
     residual_2d: torch.Tensor,
     weight: torch.Tensor,
     mc_addr_output: int,
+    sync: torch.Tensor,
+    mc_addr_sync: int,
     eps: float,
 ) -> None:
     runtime.launch(
@@ -1297,6 +1439,8 @@ def _launch_fused_twoshot(
         Int64(residual_2d.data_ptr()),
         Int64(weight.data_ptr()),
         Int64(mc_addr_output),
+        Int64(sync.data_ptr()),
+        Int64(mc_addr_sync),
         Float32(eps),
         _current_cu_stream(),
     )
@@ -1494,6 +1638,7 @@ class FusedAllreduceResidualRmsnormBf16TwoShotContext:
         eps: float,
         *,
         sync_mode: str = _SYNC_MODE_INTERNAL,
+        device_sync: bool = False,
     ):
         _require_cute()
         sync_mode = _validate_sync_mode(sync_mode)
@@ -1660,6 +1805,7 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
         eps: float,
         *,
         sync_mode: str = _SYNC_MODE_INTERNAL,
+        device_sync: bool = False,
     ):
         _require_cute()
         sync_mode = _validate_sync_mode(sync_mode)
@@ -1669,9 +1815,11 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
         self.hidden_size = hidden_size
         self.eps = eps
         self.sync_mode = sync_mode
+        self.device_sync = device_sync
         self.weight = weight.contiguous()
 
         reference_2d = reference_input.contiguous().view(-1, hidden_size)
+        world_size = dist.get_world_size()
         output_reference = torch.empty(
             (2, reference_2d.numel()),
             dtype=reference_2d.dtype,
@@ -1682,8 +1830,16 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
         self.input_2d = self.input.view(-1, hidden_size)
         self.h_out = self.output[0].view_as(self.input_2d)
         self.y_out = self.output[1].view_as(self.input_2d)
+        if device_sync:
+            sync_reference = torch.empty(
+                (world_size + 2,), dtype=torch.int32, device=reference_2d.device
+            )
+            self.sync = allocate_symmetric_tensor_like(sync_reference).view(-1)
+            self.sync.zero_()
+            torch.cuda.synchronize()
+        else:
+            self.sync = None
 
-        world_size = dist.get_world_size()
         self.threads_per_cta = _valid_fused_twoshot_threads_per_cta(
             reference_2d.shape[0],
             hidden_size,
@@ -1697,21 +1853,32 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
             self.weight,
             eps,
             self.threads_per_cta,
+            device_sync,
         )
 
         symm_input = _lookup_symmetric_input(self.input_2d)
         symm_output = _lookup_symmetric_input(self.output.reshape(-1))
-        if symm_input is None or symm_output is None:
+        symm_sync = (
+            _lookup_symmetric_input(self.sync)
+            if self.sync is not None
+            else self.runtime.symm_sync
+        )
+        if symm_input is None or symm_output is None or symm_sync is None:
             raise RuntimeError("failed to find registered symmetric buffers")
 
         self._symm_input = symm_input
         self._symm_output = symm_output
+        self._symm_sync = symm_sync
         mc_addr_in = symm_input.multicast_ptr
         mc_addr_output = symm_output.multicast_ptr
-        if mc_addr_in is None or mc_addr_output is None:
+        mc_addr_sync = symm_sync.multicast_ptr
+        if mc_addr_in is None or mc_addr_output is None or mc_addr_sync is None:
             raise NotImplementedError("symmetric memory multicast pointer is unavailable")
         self._mc_addr_in = mc_addr_in
         self._mc_addr_output = mc_addr_output
+        self._mc_addr_sync = mc_addr_sync
+        if self.sync is None:
+            self.sync = symm_sync.tensor
         self.world_size = world_size
 
     @property
@@ -1749,6 +1916,8 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
             residual_2d,
             self.weight,
             self._mc_addr_output,
+            self.sync,
+            self._mc_addr_sync,
             self.eps,
         )
         return self.y_out.view(self.shape), self.h_out.view(self.shape)
@@ -1763,7 +1932,8 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
 
         def run() -> tuple[torch.Tensor, torch.Tensor]:
             self.launch_fused(residual_2d)
-            self.output_ready()
+            if not self.device_sync:
+                self.output_ready()
             return y_view, h_view
 
         return run
@@ -1783,10 +1953,33 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotContext:
         if do_sync:
             self.input_ready()
         outputs = self.launch_fused(residual_2d)
-        self.output_ready()
+        if not self.device_sync:
+            self.output_ready()
         return outputs
 
     __call__ = forward
+
+
+class FusedAllreduceResidualRmsnormBf16FusedTwoShotDeviceSyncContext(
+    FusedAllreduceResidualRmsnormBf16FusedTwoShotContext
+):
+    """Experimental true-fused two-shot context with an in-kernel completion protocol."""
+
+    def __init__(
+        self,
+        reference_input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        sync_mode: str = _SYNC_MODE_INTERNAL,
+    ):
+        super().__init__(
+            reference_input,
+            weight,
+            eps,
+            sync_mode=sync_mode,
+            device_sync=True,
+        )
 
 
 def fused_allreduce_residual_rmsnorm_bf16(
