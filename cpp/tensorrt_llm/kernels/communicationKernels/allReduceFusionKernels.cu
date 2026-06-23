@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -127,21 +127,34 @@ public:
         }
     }
 
+    template <bool Monotonic>
     __device__ __forceinline__ void sync()
     {
         __syncthreads();
         if (threadIdx.x < NRanks)
         {
-            m_flag_value = next_flag(m_flag_value);
-            // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if the
-            // corresponding CTA has not been launched.
-            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
+            if constexpr (Monotonic)
             {
-                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
-            }
+                ++m_flag_value;
+                st_flag(m_target_flag + blockIdx.x * NRanks, m_flag_value);
 
-            while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
+                while (ld_flag(m_current_flag) != m_flag_value)
+                {
+                }
+            }
+            else
             {
+                m_flag_value = next_flag(m_flag_value);
+                // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if
+                // the corresponding CTA has not been launched.
+                for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
+                {
+                    st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+                }
+
+                while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
+                {
+                }
             }
         }
         __syncthreads();
@@ -523,7 +536,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
 #endif
 }
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool MonotonicBarrier = false>
 __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
@@ -551,7 +564,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
         }
     }
     Barrier<NRanks> barrier(params.rank, comm);
-    barrier.sync();
+    barrier.template sync<MonotonicBarrier>();
     int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / kElemsPerAccess<DType>;
     int comm_tot_access
         = (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / kElemsPerAccess<DType>;
@@ -570,7 +583,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
             reinterpret_cast<float4*>(comm.comm_bufs[r])[tot_access + idx] = sum_val;
         }
     }
-    barrier.sync();
+    barrier.template sync<MonotonicBarrier>();
 #pragma unroll
     for (int r = 0; r < NRanks; ++r)
     {
@@ -612,17 +625,24 @@ void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfi
         allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, TriggerCompletionAtEnd>, params));
 }
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool MonotonicBarrier = false>
 void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg,
     std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, DType, NRanks, Fp32Acc>,
-        params, begin_tokens, token_num_per_ranks));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+        allreduce_fusion_kernel_twoshot_sync<Pattern, DType, NRanks, Fp32Acc, MonotonicBarrier>, params, begin_tokens,
+        token_num_per_ranks));
 }
 
 bool use_oneshot(int token_num)
 {
     return token_num <= kOneShotMaxToken;
+}
+
+bool use_twoshot_monotonic_barrier()
+{
+    static char* monotonic_barrier = std::getenv("TRTLLM_AR_FUSION_TWOSHOT_MONOTONIC_BARRIER");
+    return monotonic_barrier != nullptr;
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
@@ -712,7 +732,16 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     }
     else
     {
-        launch_twoshot_sync<Pattern, DType, NRanks, Fp32Acc>(params, cfg, begin_tokens, token_num_per_ranks);
+        if (use_twoshot_monotonic_barrier())
+        {
+            launch_twoshot_sync<Pattern, DType, NRanks, Fp32Acc, true>(
+                params, cfg, begin_tokens, token_num_per_ranks);
+        }
+        else
+        {
+            launch_twoshot_sync<Pattern, DType, NRanks, Fp32Acc, false>(
+                params, cfg, begin_tokens, token_num_per_ranks);
+        }
     }
 }
 
