@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -542,12 +542,16 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
 #pragma unroll
     for (int r = 0; r < NRanks; ++r)
     {
-        int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess<DType>;
-        int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess<DType>;
-        for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
+        if (r != params.rank)
         {
-            reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx]
-                = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+            int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess<DType>;
+            int comm_tot_access
+                = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess<DType>;
+            for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
+            {
+                reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx]
+                    = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+            }
         }
     }
     Barrier<NRanks> barrier(params.rank, comm);
@@ -561,7 +565,8 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
 #pragma unroll
         for (int r = 0; r < NRanks; ++r)
         {
-            vals[r] = reinterpret_cast<float4*>(comm.comm_bufs[r])[idx];
+            vals[r] = r == params.rank ? reinterpret_cast<float4*>(params.allreduce_in)[idx]
+                                       : reinterpret_cast<float4*>(comm.comm_bufs[r])[idx];
         }
         float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
 #pragma unroll
