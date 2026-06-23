@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -191,6 +191,89 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
+template <typename T>
+__device__ __forceinline__ T warpReduceSumPartial(T val)
+{
+    constexpr int kWarpSize = 32;
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warpSize = blockDim.x - (threadIdx.x & ~(kWarpSize - 1));
+    unsigned int const activeMask = warpSize == kWarpSize ? 0xffffffffU : (1U << warpSize) - 1;
+
+#pragma unroll
+    for (int mask = kWarpSize / 2; mask > 0; mask >>= 1)
+    {
+        int const targetLane = lane ^ mask;
+        T const remote = __shfl_xor_sync(activeMask, val, mask, kWarpSize);
+        val += targetLane < warpSize ? remote : static_cast<T>(0.F);
+    }
+    return val;
+}
+
+template <typename T, bool Sync = false>
+__device__ __forceinline__ T blockReduceSumPartial(T val)
+{
+    constexpr int kWarpSize = 32;
+    constexpr int kLog2WarpSize = 5;
+    static __shared__ T shared[kWarpSize];
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warpId = threadIdx.x >> kLog2WarpSize;
+    int const warpNum = (blockDim.x + kWarpSize - 1) >> kLog2WarpSize;
+
+    val = warpId == warpNum - 1 ? warpReduceSumPartial<T>(val) : tensorrt_llm::common::warpReduceSum<T>(val);
+
+    if (lane == 0)
+    {
+        shared[warpId] = val;
+    }
+    __syncthreads();
+
+    if (warpId == 0)
+    {
+        val = lane < warpNum ? shared[lane] : static_cast<T>(0.F);
+        val = warpNum == 1 ? warpReduceSumPartial<T>(val) : tensorrt_llm::common::warpReduceSum<T>(val);
+
+        if constexpr (Sync)
+        {
+            if (lane == 0)
+            {
+                shared[0] = val;
+            }
+        }
+    }
+    if constexpr (Sync)
+    {
+        __syncthreads();
+        val = shared[0];
+    }
+    return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T blockReduceSumAllThreads(T val)
+{
+    constexpr int kWarpSize = 32;
+    static __shared__ T shared[kWarpSize];
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warpId = threadIdx.x / kWarpSize;
+    int const warpNum = blockDim.x / kWarpSize;
+
+    if ((blockDim.x & (kWarpSize - 1)) != 0)
+    {
+        return blockReduceSumPartial<T, true>(val);
+    }
+
+    val = tensorrt_llm::common::warpReduceSum<T>(val);
+    if (lane == 0)
+    {
+        shared[warpId] = val;
+    }
+    __syncthreads();
+
+    val = lane < warpNum ? shared[lane] : static_cast<T>(0.F);
+    val = tensorrt_llm::common::warpReduceSum<T>(val);
+    return val;
+}
+
 template <AllReduceFusionPattern Pattern, typename DType>
 class FusedOp
 {
@@ -287,7 +370,6 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float s_val;
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -296,37 +378,33 @@ protected:
             float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
             acc += v * v;
         }
-        tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+        acc = blockReduceSumAllThreads<float>(acc);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
-            if (threadIdx.x == 0)
+            __shared__ float clusterAcc[8];
+            float fullAcc = 0.F;
+            int const blockRank = cluster.block_rank();
+            int const blockNum = cluster.num_blocks();
+            if (threadIdx.x < blockNum)
             {
-                s_val = acc;
-                acc = 0.f;
+                cluster.map_shared_rank(&clusterAcc[0], threadIdx.x)[blockRank] = acc;
             }
-            cluster.sync();
-            if (threadIdx.x == 0)
+            cluster.barrier_wait(cluster.barrier_arrive());
+            for (int i = 0; i < blockNum; ++i)
             {
-                for (int i = 0; i < cluster.num_blocks(); ++i)
-                {
-                    acc += *cluster.map_shared_rank(&s_val, i);
-                }
+                fullAcc += clusterAcc[i];
             }
-            cluster.sync();
+            acc = fullAcc;
         }
 #endif
-        if (threadIdx.x == 0)
-        {
-            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
-        }
-        __syncthreads();
+        float const scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
