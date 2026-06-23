@@ -204,6 +204,89 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
+template <typename T>
+__device__ __forceinline__ T warpReduceSumPartial(T val)
+{
+    constexpr int kWarpSize = 32;
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warp_size = blockDim.x - (threadIdx.x & ~(kWarpSize - 1));
+    unsigned int const active_mask = (1U << warp_size) - 1;
+
+#pragma unroll
+    for (int mask = kWarpSize / 2; mask > 0; mask >>= 1)
+    {
+        int const target_lane = lane ^ mask;
+        T const remote = __shfl_xor_sync(active_mask, val, mask, kWarpSize);
+        val += target_lane < warp_size ? remote : static_cast<T>(0.F);
+    }
+    return val;
+}
+
+template <typename T, bool Sync = false>
+__device__ __forceinline__ T blockReduceSumPartial(T val)
+{
+    constexpr int kWarpSize = 32;
+    constexpr int kLog2WarpSize = 5;
+    static __shared__ T shared[kWarpSize];
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warp_id = threadIdx.x >> kLog2WarpSize;
+    int const warp_num = (blockDim.x + kWarpSize - 1) >> kLog2WarpSize;
+
+    val = warp_id == warp_num - 1 ? warpReduceSumPartial<T>(val) : tensorrt_llm::common::warpReduceSum<T>(val);
+
+    if (lane == 0)
+    {
+        shared[warp_id] = val;
+    }
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        val = lane < warp_num ? shared[lane] : static_cast<T>(0.F);
+        val = warp_num == 1 ? warpReduceSumPartial<T>(val) : tensorrt_llm::common::warpReduceSum<T>(val);
+
+        if constexpr (Sync)
+        {
+            if (lane == 0)
+            {
+                shared[0] = val;
+            }
+        }
+    }
+    if constexpr (Sync)
+    {
+        __syncthreads();
+        val = shared[0];
+    }
+    return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T blockReduceSumAllThreads(T val)
+{
+    constexpr int kWarpSize = 32;
+    static __shared__ T shared[kWarpSize];
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    int const warp_id = threadIdx.x / kWarpSize;
+    int const warp_num = blockDim.x / kWarpSize;
+
+    if ((blockDim.x & (kWarpSize - 1)) != 0)
+    {
+        return blockReduceSumPartial<T, true>(val);
+    }
+
+    val = tensorrt_llm::common::warpReduceSum<T>(val);
+    if (lane == 0)
+    {
+        shared[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = lane < warp_num ? shared[lane] : static_cast<T>(0.F);
+    val = tensorrt_llm::common::warpReduceSum<T>(val);
+    return val;
+}
+
 template <AllReduceFusionPattern Pattern, typename DType>
 class FusedOp
 {
@@ -300,7 +383,6 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float s_val;
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -309,37 +391,33 @@ protected:
             float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
             acc += v * v;
         }
-        tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+        acc = blockReduceSumAllThreads<float>(acc);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
-            if (threadIdx.x == 0)
+            __shared__ float shared_val[8];
+            float full_acc = 0.f;
+            int const block_rank = cluster.block_rank();
+            int const num_blocks = cluster.num_blocks();
+            if (threadIdx.x < num_blocks)
             {
-                s_val = acc;
-                acc = 0.f;
+                cluster.map_shared_rank(&shared_val[0], threadIdx.x)[block_rank] = acc;
             }
-            cluster.sync();
-            if (threadIdx.x == 0)
+            cluster.barrier_wait(cluster.barrier_arrive());
+            for (int i = 0; i < num_blocks; ++i)
             {
-                for (int i = 0; i < cluster.num_blocks(); ++i)
-                {
-                    acc += *cluster.map_shared_rank(&s_val, i);
-                }
+                full_acc += shared_val[i];
             }
-            cluster.sync();
+            acc = full_acc;
         }
 #endif
-        if (threadIdx.x == 0)
-        {
-            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
-        }
-        __syncthreads();
+        float const scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
