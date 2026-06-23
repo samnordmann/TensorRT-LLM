@@ -481,9 +481,12 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
         for (int r = 0; r < NRanks; ++r)
         {
-            // Push data to other ranks
-            reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
-                = *reinterpret_cast<float4*>(val);
+            if (r != params.rank)
+            {
+                // Push data to other ranks
+                reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
+                    = *reinterpret_cast<float4*>(val);
+            }
         }
     }
     for (int idx = access_id; idx < clear_access; idx += access_stride)
@@ -496,6 +499,16 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
     {
         fused_op.update(idx);
         float4 vals[NRanks];
+        alignas(16) float local_val[4];
+        *reinterpret_cast<float4*>(local_val) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            if (is_neg_zero(local_val[i]))
+            {
+                local_val[i] = 0.f;
+            }
+        }
         bool done = false;
         while (!done)
         {
@@ -503,10 +516,17 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
             for (int r = 0; r < NRanks; ++r)
             {
-                // LDG.128 from local rank
-                vals[r]
-                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
-                done &= !is_neg_zero(vals[r]);
+                if (r == params.rank)
+                {
+                    vals[r] = *reinterpret_cast<float4*>(local_val);
+                }
+                else
+                {
+                    // LDG.128 from local rank
+                    vals[r] = ld_global_volatile(
+                        &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
+                    done &= !is_neg_zero(vals[r]);
+                }
             }
         }
         float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
