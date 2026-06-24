@@ -1573,6 +1573,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if cta_idx == self.sync_cta:
                 if tidx == 0:
+                    phase2_seen = _ld_global_i32_volatile(
+                        uc_sync.iterator + self.phase2_sync_base + 2 + self.rank
+                    )
                     _fence_acq_rel_sys()
                     self._publish_phase(uc_sync, mc_sync, 0)
                     self._sync_phase(
@@ -1587,6 +1590,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.phase2_sync_base,
                         self.real_owned_tiles,
                     )
+                    self._wait_phase(uc_sync, self.phase2_sync_base, phase2_seen)
             else:
                 phase0_seen = _ld_global_i32_volatile(uc_sync.iterator + 2 + self.rank)
                 phase1_seen = _ld_global_i32_volatile(
