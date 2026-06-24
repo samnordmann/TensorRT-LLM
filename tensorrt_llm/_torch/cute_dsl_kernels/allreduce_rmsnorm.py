@@ -89,6 +89,17 @@ class _FusedTwoShotRuntime:
     threads_per_cta: int
 
 
+@dataclass
+class _TileFusedTwoShotRuntime:
+    symm_input: _SymmTensor
+    symm_output: _SymmTensor
+    symm_partials: _SymmTensor
+    symm_sync: _SymmTensor
+    launch: Callable
+    threads_per_cta: int
+    worker_ctas: int
+
+
 _RUNTIME_CACHE: dict[tuple[int, int, int, torch.dtype], _Runtime] = {}
 _TWOSHOT_RUNTIME_CACHE: dict[
     tuple[int, int, int, torch.dtype, int, int, int, int, bool],
@@ -97,6 +108,10 @@ _TWOSHOT_RUNTIME_CACHE: dict[
 _FUSED_TWOSHOT_RUNTIME_CACHE: dict[
     tuple[int, int, int, torch.dtype, int, int, int, bool],
     _FusedTwoShotRuntime,
+] = {}
+_TILE_FUSED_TWOSHOT_RUNTIME_CACHE: dict[
+    tuple[int, int, int, torch.dtype, int, int, int, int],
+    _TileFusedTwoShotRuntime,
 ] = {}
 _REGISTERED_SYMM_INPUTS: dict[tuple[int, int, int, torch.dtype], _SymmTensor] = {}
 
@@ -204,6 +219,24 @@ def _valid_fused_twoshot_threads_per_cta(rows: int, hidden_size: int) -> int:
     if rows >= 512 and hidden_size >= 8192 and 256 in valid:
         return 256
     return _valid_twoshot_rmsnorm_threads_per_cta(rows, hidden_size)
+
+
+def _valid_tile_fused_twoshot_threads_per_cta(hidden_size: int) -> int:
+    override = _twoshot_threads_per_cta_override(
+        "TRTLLM_CUTE_AR_RMSNORM_TILE_FUSED_TWOSHOT_THREADS_PER_CTA"
+    )
+    valid = _valid_threads_per_cta_values(hidden_size)
+    if not valid:
+        raise NotImplementedError(f"hidden_size={hidden_size} is not supported")
+    if override is not None:
+        return _validate_threads_per_cta_override(hidden_size, override, valid)
+    return 128 if 128 in valid else valid[0]
+
+
+def _tile_fused_twoshot_worker_ctas(owned_tiles: int) -> int:
+    override = os.environ.get("TRTLLM_CUTE_AR_RMSNORM_TILE_FUSED_TWOSHOT_WORKERS")
+    limit = int(override) if override is not None else 64
+    return min(max(1, owned_tiles), max(1, limit))
 
 
 def _use_twoshot_tile_ownership(rows: int, world_size: int) -> bool:
@@ -391,6 +424,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ],
             "multimem.st.global.v4.f32 [$0], {$1,$2,$3,$4};",
             "l,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_global_f32(uc_ptr: cute.Pointer, *, loc=None, ip=None):
+        ptr_i64 = llvm.ptrtoint(T.i64(), uc_ptr.llvm_ptr, loc=loc, ip=ip)
+        result = llvm.inline_asm(
+            T.f32(),
+            [ptr_i64],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        return Float32(result)
+
+    @dsl_user_op
+    def _multimem_st_f32(mc_ptr: cute.Pointer, value, *, loc=None, ip=None):
+        ptr_i64 = llvm.ptrtoint(T.i64(), mc_ptr.llvm_ptr, loc=loc, ip=ip)
+        llvm.inline_asm(
+            None,
+            [
+                ptr_i64,
+                Float32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "multimem.st.global.f32 [$0], $1;",
+            "l,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1125,6 +1192,308 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
 
+    class _TileFusedTwoShotBf16Launcher:
+        def __init__(
+            self,
+            rows: int,
+            hidden_size: int,
+            threads_per_cta: int,
+            worker_ctas: int,
+            world_size: int,
+            rank: int,
+        ):
+            self.rows = rows
+            self.hidden_size = hidden_size
+            self.threads_per_cta = threads_per_cta
+            self.worker_ctas = worker_ctas
+            self.world_size = world_size
+            self.rank = rank
+            self.vec_chunks = hidden_size // (threads_per_cta * 8)
+            self.total_tiles = rows * self.vec_chunks
+            self.real_owned_tiles = (
+                (self.total_tiles + world_size - 1 - rank) // world_size
+                if rank < self.total_tiles
+                else 0
+            )
+            self.numel = rows * hidden_size
+            self.phase_sync_size = world_size + 2
+            self.phase2_sync_base = self.phase_sync_size
+
+        @cute.kernel
+        def kernel(
+            self,
+            mc_in: cute.Tensor,
+            uc_residual: cute.Tensor,
+            uc_weight: cute.Tensor,
+            mc_output: cute.Tensor,
+            uc_output: cute.Tensor,
+            mc_partials: cute.Tensor,
+            uc_partials: cute.Tensor,
+            uc_sync: cute.Tensor,
+            mc_sync: cute.Tensor,
+            eps: Float32,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            worker_idx, _, _ = cute.arch.block_idx()
+
+            if worker_idx == self.worker_ctas:
+                if tidx == 0:
+                    self._sync_phase(uc_sync, mc_sync, 0)
+                    self._sync_phase(uc_sync, mc_sync, self.phase2_sync_base)
+            else:
+                num_warps = self.threads_per_cta // 32
+                smem_ptr = cute.arch.alloc_smem(Float32, num_warps + 1)
+                smem = cute.make_tensor(smem_ptr, cute.make_layout((num_warps + 1,)))
+                phase1_seen = _ld_global_i32_volatile(uc_sync.iterator + 2 + self.rank)
+                phase2_seen = _ld_global_i32_volatile(
+                    uc_sync.iterator + self.phase2_sync_base + 2 + self.rank
+                )
+
+                owned_idx = worker_idx
+                while owned_idx < self.real_owned_tiles:
+                    tile_id = owned_idx * self.world_size + self.rank
+                    self._compute_h_tile(
+                        tidx,
+                        tile_id,
+                        smem,
+                        mc_in,
+                        uc_residual,
+                        mc_output,
+                        mc_partials,
+                    )
+                    owned_idx += self.worker_ctas
+
+                cute.arch.barrier()
+                if tidx == 0:
+                    _fence_acq_rel_sys()
+                    _atom_global_add_i32(uc_sync.iterator + 0, Int32(1))
+                    for peer in cutlass.range_constexpr(self.world_size):
+                        while _ld_global_i32_volatile(uc_sync.iterator + 2 + peer) <= phase1_seen:
+                            _spin_pause()
+                cute.arch.barrier()
+
+                owned_idx = worker_idx
+                while owned_idx < self.real_owned_tiles:
+                    tile_id = owned_idx * self.world_size + self.rank
+                    self._compute_y_tile(
+                        tidx,
+                        tile_id,
+                        uc_weight,
+                        mc_output,
+                        uc_output,
+                        uc_partials,
+                        eps,
+                    )
+                    owned_idx += self.worker_ctas
+
+                cute.arch.barrier()
+                if tidx == 0:
+                    _fence_acq_rel_sys()
+                    _atom_global_add_i32(
+                        uc_sync.iterator + self.phase2_sync_base + 0, Int32(1)
+                    )
+                    for peer in cutlass.range_constexpr(self.world_size):
+                        while (
+                            _ld_global_i32_volatile(
+                                uc_sync.iterator + self.phase2_sync_base + 2 + peer
+                            )
+                            <= phase2_seen
+                        ):
+                            _spin_pause()
+                cute.arch.barrier()
+
+        @cute.jit
+        def _sync_phase(
+            self,
+            uc_sync: cute.Tensor,
+            mc_sync: cute.Tensor,
+            base: cutlass.Constexpr,
+        ):
+            epoch = _atom_global_add_i32(uc_sync.iterator + base + 1, Int32(1)) + Int32(1)
+            target = epoch * Int32(self.worker_ctas)
+            while _ld_global_i32_volatile(uc_sync.iterator + base + 0) < target:
+                _spin_pause()
+
+            _fence_acq_rel_sys()
+            _multimem_st_i32(mc_sync.iterator + base + 2 + self.rank, epoch)
+
+        @cute.jit
+        def _block_sum(self, value, smem: cute.Tensor):
+            lane_idx = cute.arch.lane_idx()
+            warp_idx = cute.arch.warp_idx()
+            num_warps = self.threads_per_cta // 32
+
+            value = cute.arch.warp_reduction_sum(value)
+            if lane_idx == 0:
+                smem[warp_idx] = value
+            cute.arch.barrier()
+
+            if warp_idx == 0:
+                part = Float32(0.0)
+                if lane_idx < num_warps:
+                    part = smem[lane_idx]
+                part = cute.arch.warp_reduction_sum(part)
+                if lane_idx == 0:
+                    smem[num_warps] = part
+            cute.arch.barrier()
+            return smem[num_warps]
+
+        @cute.jit
+        def _compute_h_tile(
+            self,
+            tidx,
+            tile_id,
+            smem: cute.Tensor,
+            mc_in: cute.Tensor,
+            uc_residual: cute.Tensor,
+            mc_output: cute.Tensor,
+            mc_partials: cute.Tensor,
+        ):
+            row = tile_id // self.vec_chunks
+            chunk = tile_id - row * self.vec_chunks
+            col = chunk * self.threads_per_cta * 8 + tidx * 8
+            offset = row * self.hidden_size + col
+
+            r0, r1, r2, r3 = utils.distributed.multimem_ld_reduce_8xbf16(
+                mc_in.iterator + offset
+            )
+            b0, b1 = _i32_to_bf16_pair(r0)
+            b2, b3 = _i32_to_bf16_pair(r1)
+            b4, b5 = _i32_to_bf16_pair(r2)
+            b6, b7 = _i32_to_bf16_pair(r3)
+
+            res_r0, res_r1, res_r2, res_r3 = _ld_global_8xbf16(
+                uc_residual.iterator + offset
+            )
+            res0, res1 = _i32_to_bf16_pair(res_r0)
+            res2, res3 = _i32_to_bf16_pair(res_r1)
+            res4, res5 = _i32_to_bf16_pair(res_r2)
+            res6, res7 = _i32_to_bf16_pair(res_r3)
+
+            h0 = Float32(b0) + Float32(res0)
+            h1 = Float32(b1) + Float32(res1)
+            h2 = Float32(b2) + Float32(res2)
+            h3 = Float32(b3) + Float32(res3)
+            h4 = Float32(b4) + Float32(res4)
+            h5 = Float32(b5) + Float32(res5)
+            h6 = Float32(b6) + Float32(res6)
+            h7 = Float32(b7) + Float32(res7)
+
+            _multimem_st_8xbf16(
+                mc_output.iterator + offset,
+                _f32x2_to_bf16x2(h0, h1),
+                _f32x2_to_bf16x2(h2, h3),
+                _f32x2_to_bf16x2(h4, h5),
+                _f32x2_to_bf16x2(h6, h7),
+            )
+
+            sum_sq = (
+                h0 * h0
+                + h1 * h1
+                + h2 * h2
+                + h3 * h3
+                + h4 * h4
+                + h5 * h5
+                + h6 * h6
+                + h7 * h7
+            )
+            tile_sum = self._block_sum(sum_sq, smem)
+            if tidx == 0:
+                _multimem_st_f32(mc_partials.iterator + row * self.vec_chunks + chunk, tile_sum)
+
+        @cute.jit
+        def _compute_y_tile(
+            self,
+            tidx,
+            tile_id,
+            uc_weight: cute.Tensor,
+            mc_output: cute.Tensor,
+            uc_output: cute.Tensor,
+            uc_partials: cute.Tensor,
+            eps: Float32,
+        ):
+            row = tile_id // self.vec_chunks
+            chunk = tile_id - row * self.vec_chunks
+            col = chunk * self.threads_per_cta * 8 + tidx * 8
+            offset = row * self.hidden_size + col
+
+            row_sum = Float32(0.0)
+            for c in cutlass.range_constexpr(self.vec_chunks):
+                row_sum += _ld_global_f32(uc_partials.iterator + row * self.vec_chunks + c)
+            inv_rms = cute.math.rsqrt(row_sum / Float32(self.hidden_size) + eps, fastmath=True)
+
+            h_r0, h_r1, h_r2, h_r3 = _ld_global_8xbf16(uc_output.iterator + offset)
+            h0, h1 = _i32_to_bf16_pair(h_r0)
+            h2, h3 = _i32_to_bf16_pair(h_r1)
+            h4, h5 = _i32_to_bf16_pair(h_r2)
+            h6, h7 = _i32_to_bf16_pair(h_r3)
+
+            w_r0, w_r1, w_r2, w_r3 = _ld_global_8xbf16(uc_weight.iterator + col)
+            w0, w1 = _i32_to_bf16_pair(w_r0)
+            w2, w3 = _i32_to_bf16_pair(w_r1)
+            w4, w5 = _i32_to_bf16_pair(w_r2)
+            w6, w7 = _i32_to_bf16_pair(w_r3)
+
+            y0 = Float32(h0) * inv_rms * Float32(w0)
+            y1 = Float32(h1) * inv_rms * Float32(w1)
+            y2 = Float32(h2) * inv_rms * Float32(w2)
+            y3 = Float32(h3) * inv_rms * Float32(w3)
+            y4 = Float32(h4) * inv_rms * Float32(w4)
+            y5 = Float32(h5) * inv_rms * Float32(w5)
+            y6 = Float32(h6) * inv_rms * Float32(w6)
+            y7 = Float32(h7) * inv_rms * Float32(w7)
+
+            _multimem_st_8xbf16(
+                mc_output.iterator + self.numel + offset,
+                _f32x2_to_bf16x2(y0, y1),
+                _f32x2_to_bf16x2(y2, y3),
+                _f32x2_to_bf16x2(y4, y5),
+                _f32x2_to_bf16x2(y6, y7),
+            )
+
+        @cute.jit
+        def __call__(
+            self,
+            mc_addr_in: Int64,
+            uc_addr_residual: Int64,
+            uc_addr_weight: Int64,
+            mc_addr_output: Int64,
+            uc_addr_output: Int64,
+            mc_addr_partials: Int64,
+            uc_addr_partials: Int64,
+            uc_addr_sync: Int64,
+            mc_addr_sync: Int64,
+            eps: Float32,
+            stream: cuda.CUstream,
+        ):
+            mc_in = _raw_tensor_2d(mc_addr_in, BFloat16, self.rows, self.hidden_size)
+            uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
+            uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
+            mc_output = _raw_tensor_1d(mc_addr_output, BFloat16, self.numel * 2)
+            uc_output = _raw_tensor_1d(uc_addr_output, BFloat16, self.numel * 2)
+            mc_partials = _raw_tensor_1d(mc_addr_partials, Float32, self.rows * self.vec_chunks)
+            uc_partials = _raw_tensor_1d(uc_addr_partials, Float32, self.rows * self.vec_chunks)
+            uc_sync = _raw_tensor_1d(uc_addr_sync, Int32, self.phase_sync_size * 2)
+            mc_sync = _raw_tensor_1d(mc_addr_sync, Int32, self.phase_sync_size * 2)
+
+            self.kernel(
+                mc_in,
+                uc_res,
+                uc_w,
+                mc_output,
+                uc_output,
+                mc_partials,
+                uc_partials,
+                uc_sync,
+                mc_sync,
+                eps,
+            ).launch(
+                grid=[self.worker_ctas + 1, 1, 1],
+                block=[self.threads_per_cta, 1, 1],
+                stream=stream,
+            )
+
+
 def _make_runtime(
     input_2d: torch.Tensor,
     residual_2d: torch.Tensor,
@@ -1372,6 +1741,103 @@ def _get_fused_twoshot_runtime(
     return runtime
 
 
+def _make_tile_fused_twoshot_runtime(
+    input_2d: torch.Tensor,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    threads_per_cta: int,
+    worker_ctas: int,
+) -> _TileFusedTwoShotRuntime:
+    _require_cute()
+    rows, hidden_size = input_2d.shape
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    vec_chunks = hidden_size // (threads_per_cta * 8)
+
+    symm_input = _alloc_symm_tensor(input_2d.numel(), input_2d.dtype)
+    symm_output = _alloc_symm_tensor(input_2d.numel() * 2, input_2d.dtype)
+    symm_partials = _alloc_symm_tensor(rows * vec_chunks, torch.float32)
+    symm_sync = _alloc_symm_tensor((world_size + 2) * 2, torch.int32)
+
+    mc_addr_in = symm_input.multicast_ptr
+    mc_addr_output = symm_output.multicast_ptr
+    mc_addr_partials = symm_partials.multicast_ptr
+    mc_addr_sync = symm_sync.multicast_ptr
+    if (
+        mc_addr_in is None
+        or mc_addr_output is None
+        or mc_addr_partials is None
+        or mc_addr_sync is None
+    ):
+        raise NotImplementedError("symmetric memory multicast pointer is unavailable")
+
+    launcher = _TileFusedTwoShotBf16Launcher(
+        rows,
+        hidden_size,
+        threads_per_cta,
+        worker_ctas,
+        world_size,
+        rank,
+    )
+    launch = cute.compile(
+        launcher,
+        Int64(mc_addr_in),
+        Int64(residual_2d.data_ptr()),
+        Int64(weight.data_ptr()),
+        Int64(mc_addr_output),
+        Int64(symm_output.tensor.data_ptr()),
+        Int64(mc_addr_partials),
+        Int64(symm_partials.tensor.data_ptr()),
+        Int64(symm_sync.tensor.data_ptr()),
+        Int64(mc_addr_sync),
+        Float32(eps),
+        make_fake_stream(),
+    )
+
+    return _TileFusedTwoShotRuntime(
+        symm_input=symm_input,
+        symm_output=symm_output,
+        symm_partials=symm_partials,
+        symm_sync=symm_sync,
+        launch=launch,
+        threads_per_cta=threads_per_cta,
+        worker_ctas=worker_ctas,
+    )
+
+
+def _get_tile_fused_twoshot_runtime(
+    input_2d: torch.Tensor,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    threads_per_cta: int,
+    worker_ctas: int,
+) -> _TileFusedTwoShotRuntime:
+    key = (
+        torch.cuda.current_device(),
+        input_2d.shape[0],
+        input_2d.shape[1],
+        input_2d.dtype,
+        dist.get_world_size(),
+        dist.get_rank(),
+        threads_per_cta,
+        worker_ctas,
+    )
+    runtime = _TILE_FUSED_TWOSHOT_RUNTIME_CACHE.get(key)
+    if runtime is None:
+        runtime = _make_tile_fused_twoshot_runtime(
+            input_2d,
+            residual_2d,
+            weight,
+            eps,
+            threads_per_cta,
+            worker_ctas,
+        )
+        _TILE_FUSED_TWOSHOT_RUNTIME_CACHE[key] = runtime
+    return runtime
+
+
 def _launch_runtime(
     runtime: _Runtime,
     mc_addr: int,
@@ -1439,6 +1905,34 @@ def _launch_fused_twoshot(
         Int64(residual_2d.data_ptr()),
         Int64(weight.data_ptr()),
         Int64(mc_addr_output),
+        Int64(sync.data_ptr()),
+        Int64(mc_addr_sync),
+        Float32(eps),
+        _current_cu_stream(),
+    )
+
+
+def _launch_tile_fused_twoshot(
+    runtime: _TileFusedTwoShotRuntime,
+    mc_addr_in: int,
+    residual_2d: torch.Tensor,
+    weight: torch.Tensor,
+    mc_addr_output: int,
+    output: torch.Tensor,
+    mc_addr_partials: int,
+    partials: torch.Tensor,
+    sync: torch.Tensor,
+    mc_addr_sync: int,
+    eps: float,
+) -> None:
+    runtime.launch(
+        Int64(mc_addr_in),
+        Int64(residual_2d.data_ptr()),
+        Int64(weight.data_ptr()),
+        Int64(mc_addr_output),
+        Int64(output.data_ptr()),
+        Int64(mc_addr_partials),
+        Int64(partials.data_ptr()),
         Int64(sync.data_ptr()),
         Int64(mc_addr_sync),
         Float32(eps),
@@ -1982,6 +2476,183 @@ class FusedAllreduceResidualRmsnormBf16FusedTwoShotDeviceSyncContext(
         )
 
 
+class FusedAllreduceResidualRmsnormBf16TileFusedTwoShotDeviceSyncContext:
+    """Tile-owned single-kernel two-shot experiment with in-kernel completion."""
+
+    def __init__(
+        self,
+        reference_input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        sync_mode: str = _SYNC_MODE_INTERNAL,
+    ):
+        _require_cute()
+        sync_mode = _validate_sync_mode(sync_mode)
+        hidden_size = _check_common_inputs(reference_input, reference_input, weight)
+
+        self.shape = reference_input.shape
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.sync_mode = sync_mode
+        self.weight = weight.contiguous()
+
+        reference_2d = reference_input.contiguous().view(-1, hidden_size)
+        output_reference = torch.empty(
+            (2, reference_2d.numel()),
+            dtype=reference_2d.dtype,
+            device=reference_2d.device,
+        )
+        self.input = allocate_symmetric_tensor_like(reference_2d).view_as(reference_2d)
+        self.output = allocate_symmetric_tensor_like(output_reference).view(
+            2, reference_2d.numel()
+        )
+        self.input_2d = self.input.view(-1, hidden_size)
+        self.h_out = self.output[0].view_as(self.input_2d)
+        self.y_out = self.output[1].view_as(self.input_2d)
+
+        world_size = dist.get_world_size()
+        self.threads_per_cta = _valid_tile_fused_twoshot_threads_per_cta(hidden_size)
+        vec_chunks = hidden_size // (self.threads_per_cta * 8)
+        total_tiles = reference_2d.shape[0] * vec_chunks
+        rank = dist.get_rank()
+        owned_tiles = (
+            (total_tiles + world_size - 1 - rank) // world_size
+            if rank < total_tiles
+            else 0
+        )
+        self.worker_ctas = _tile_fused_twoshot_worker_ctas(owned_tiles)
+
+        sync_reference = torch.empty(
+            ((world_size + 2) * 2,), dtype=torch.int32, device=reference_2d.device
+        )
+        partials_reference = torch.empty(
+            (reference_2d.shape[0] * vec_chunks,),
+            dtype=torch.float32,
+            device=reference_2d.device,
+        )
+        self.sync = allocate_symmetric_tensor_like(sync_reference).view(-1)
+        self.partials = allocate_symmetric_tensor_like(partials_reference).view(-1)
+        self.sync.zero_()
+        torch.cuda.synchronize()
+
+        _enable_symmetric_memory()
+        cutlass.cuda.initialize_cuda_context(torch.cuda.current_device())
+        self.runtime = _get_tile_fused_twoshot_runtime(
+            self.input_2d,
+            reference_2d,
+            self.weight,
+            eps,
+            self.threads_per_cta,
+            self.worker_ctas,
+        )
+
+        symm_input = _lookup_symmetric_input(self.input_2d)
+        symm_output = _lookup_symmetric_input(self.output.reshape(-1))
+        symm_partials = _lookup_symmetric_input(self.partials)
+        symm_sync = _lookup_symmetric_input(self.sync)
+        if (
+            symm_input is None
+            or symm_output is None
+            or symm_partials is None
+            or symm_sync is None
+        ):
+            raise RuntimeError("failed to find registered symmetric buffers")
+
+        self._symm_input = symm_input
+        self._symm_output = symm_output
+        self._symm_partials = symm_partials
+        self._symm_sync = symm_sync
+        mc_addr_in = symm_input.multicast_ptr
+        mc_addr_output = symm_output.multicast_ptr
+        mc_addr_partials = symm_partials.multicast_ptr
+        mc_addr_sync = symm_sync.multicast_ptr
+        if (
+            mc_addr_in is None
+            or mc_addr_output is None
+            or mc_addr_partials is None
+            or mc_addr_sync is None
+        ):
+            raise NotImplementedError("symmetric memory multicast pointer is unavailable")
+        self._mc_addr_in = mc_addr_in
+        self._mc_addr_output = mc_addr_output
+        self._mc_addr_partials = mc_addr_partials
+        self._mc_addr_sync = mc_addr_sync
+
+    @property
+    def symmetric_input(self) -> torch.Tensor:
+        return self.input.view(self.shape)
+
+    def copy_input_(self, input: torch.Tensor) -> torch.Tensor:
+        if input.shape != self.shape:
+            raise NotImplementedError("input shape must match the context shape")
+        if input.dtype != torch.bfloat16:
+            raise NotImplementedError("only bf16 input is supported")
+        self.input_2d.copy_(input.contiguous().view(-1, self.hidden_size))
+        return self.symmetric_input
+
+    def input_ready(self) -> None:
+        self._symm_input.handle.barrier()
+
+    def _prepare_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        if residual.shape != self.shape:
+            raise NotImplementedError("residual shape must match the context shape")
+        if residual.dtype != torch.bfloat16:
+            raise NotImplementedError("only bf16 residual is supported")
+        return residual.contiguous().view(-1, self.hidden_size)
+
+    def prepare_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        return self._prepare_residual(residual)
+
+    def launch_fused(self, residual_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _launch_tile_fused_twoshot(
+            self.runtime,
+            self._mc_addr_in,
+            residual_2d,
+            self.weight,
+            self._mc_addr_output,
+            self.output,
+            self._mc_addr_partials,
+            self.partials,
+            self.sync,
+            self._mc_addr_sync,
+            self.eps,
+        )
+        return self.y_out.view(self.shape), self.h_out.view(self.shape)
+
+    def make_prepared_forward(
+        self,
+        residual: torch.Tensor,
+    ) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+        residual_2d = self.prepare_residual(residual)
+        y_view = self.y_out.view(self.shape)
+        h_view = self.h_out.view(self.shape)
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            self.launch_fused(residual_2d)
+            return y_view, h_view
+
+        return run
+
+    def forward(
+        self,
+        residual: torch.Tensor,
+        input: torch.Tensor | None = None,
+        *,
+        sync: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if input is not None:
+            self.copy_input_(input)
+
+        residual_2d = self._prepare_residual(residual)
+        do_sync = self.sync_mode == _SYNC_MODE_INTERNAL if sync is None else sync
+        if do_sync:
+            self.input_ready()
+        return self.launch_fused(residual_2d)
+
+    __call__ = forward
+
+
 def fused_allreduce_residual_rmsnorm_bf16(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -2049,4 +2720,22 @@ def fused_allreduce_residual_rmsnorm_bf16_fused_twoshot(
         raise NotImplementedError("CuTe fused two-shot allreduce RMSNorm POC is not CUDA-graph safe")
 
     context = FusedAllreduceResidualRmsnormBf16FusedTwoShotContext(input, weight, eps)
+    return context.forward(residual, input)
+
+
+def fused_allreduce_residual_rmsnorm_bf16_tile_fused_twoshot(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute()
+    if torch.cuda.is_current_stream_capturing():
+        raise NotImplementedError(
+            "CuTe tile-fused two-shot allreduce RMSNorm POC is not CUDA-graph safe"
+        )
+
+    context = FusedAllreduceResidualRmsnormBf16TileFusedTwoShotDeviceSyncContext(
+        input, weight, eps
+    )
     return context.forward(residual, input)
