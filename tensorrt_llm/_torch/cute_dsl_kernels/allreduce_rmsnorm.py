@@ -487,7 +487,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         result = llvm.inline_asm(
             T.f32(),
             [ptr_i64],
-            "multimem.ld_reduce.global.add.f32 $0, [$1];",
+            "multimem.ld_reduce.relaxed.sys.global.add.f32 $0, [$1];",
             "=f,l",
             has_side_effects=True,
             is_align_stack=False,
