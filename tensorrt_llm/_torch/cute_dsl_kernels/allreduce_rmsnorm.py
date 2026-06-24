@@ -1584,6 +1584,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else 0
             )
             self.numel = rows * hidden_size
+            self.row_partial_stride = 32
             self.phase_sync_size = world_size + 2
             self.phase1_sync_base = self.phase_sync_size
             self.phase2_sync_base = self.phase_sync_size * 2
@@ -1609,7 +1610,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if tidx == 0:
                     row = 0
                     while row < self.rows:
-                        uc_row_partials[row] = Float32(0.0)
+                        uc_row_partials[row * self.row_partial_stride] = Float32(0.0)
                         row += 1
                     _fence_acq_rel_sys()
                     self._publish_phase(uc_sync, mc_sync, 0)
@@ -1691,13 +1692,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 tile_sum = self._block_sum(sum_sq, smem)
                 if tidx == 0:
-                    _red_global_add_f32(uc_row_partials.iterator + row, tile_sum)
+                    _red_global_add_f32(
+                        uc_row_partials.iterator + row * self.row_partial_stride,
+                        tile_sum,
+                    )
                     _fence_acq_rel_sys()
                     _atom_global_add_i32(uc_sync.iterator + self.phase1_sync_base + 0, Int32(1))
 
                 self._wait_phase(uc_sync, self.phase1_sync_base, phase1_seen)
 
-                row_sum = _multimem_ld_reduce_f32(mc_row_partials.iterator + row)
+                row_sum = _multimem_ld_reduce_f32(
+                    mc_row_partials.iterator + row * self.row_partial_stride
+                )
                 inv_rms = cute.math.rsqrt(
                     row_sum / Float32(self.hidden_size) + eps,
                     fastmath=True,
@@ -1807,8 +1813,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
             uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
             mc_output = _raw_tensor_1d(mc_addr_output, BFloat16, self.numel * 2)
-            mc_row_partials = _raw_tensor_1d(mc_addr_row_partials, Float32, self.rows)
-            uc_row_partials = _raw_tensor_1d(uc_addr_row_partials, Float32, self.rows)
+            mc_row_partials = _raw_tensor_1d(
+                mc_addr_row_partials, Float32, self.rows * self.row_partial_stride
+            )
+            uc_row_partials = _raw_tensor_1d(
+                uc_addr_row_partials, Float32, self.rows * self.row_partial_stride
+            )
             uc_sync = _raw_tensor_1d(uc_addr_sync, Int32, self.phase_sync_size * 3)
             mc_sync = _raw_tensor_1d(mc_addr_sync, Int32, self.phase_sync_size * 3)
 
