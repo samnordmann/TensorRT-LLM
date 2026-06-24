@@ -104,7 +104,7 @@ class _TileFusedTwoShotRuntime:
 class _RegisterTileFusedTwoShotRuntime:
     symm_input: _SymmTensor
     symm_output: _SymmTensor
-    symm_row_partials: _SymmTensor
+    symm_partials: _SymmTensor
     symm_sync: _SymmTensor
     launch: Callable
     threads_per_cta: int
@@ -480,40 +480,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ip=ip,
         )
         return Float32(result)
-
-    @dsl_user_op
-    def _multimem_ld_reduce_f32(mc_ptr: cute.Pointer, *, loc=None, ip=None):
-        ptr_i64 = llvm.ptrtoint(T.i64(), mc_ptr.llvm_ptr, loc=loc, ip=ip)
-        result = llvm.inline_asm(
-            T.f32(),
-            [ptr_i64],
-            "multimem.ld_reduce.relaxed.sys.global.add.f32 $0, [$1];",
-            "=f,l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-        return Float32(result)
-
-    @dsl_user_op
-    def _red_global_add_f32(uc_ptr: cute.Pointer, value, *, loc=None, ip=None):
-        ptr_i64 = llvm.ptrtoint(T.i64(), uc_ptr.llvm_ptr, loc=loc, ip=ip)
-        llvm.inline_asm(
-            None,
-            [
-                ptr_i64,
-                Float32(value).ir_value(loc=loc, ip=ip),
-            ],
-            "red.global.add.f32 [$0], $1;",
-            "l,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
 
     @dsl_user_op
     def _multimem_st_f32(mc_ptr: cute.Pointer, value, *, loc=None, ip=None):
@@ -1584,7 +1550,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else 0
             )
             self.numel = rows * hidden_size
-            self.row_partial_stride = 32
             self.phase_sync_size = world_size + 2
             self.phase1_sync_base = self.phase_sync_size
             self.phase2_sync_base = self.phase_sync_size * 2
@@ -1597,8 +1562,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_residual: cute.Tensor,
             uc_weight: cute.Tensor,
             mc_output: cute.Tensor,
-            mc_row_partials: cute.Tensor,
-            uc_row_partials: cute.Tensor,
+            mc_partials: cute.Tensor,
+            uc_partials: cute.Tensor,
             uc_sync: cute.Tensor,
             mc_sync: cute.Tensor,
             eps: Float32,
@@ -1608,10 +1573,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if cta_idx == self.sync_cta:
                 if tidx == 0:
-                    row = 0
-                    while row < self.rows:
-                        uc_row_partials[row * self.row_partial_stride] = Float32(0.0)
-                        row += 1
                     _fence_acq_rel_sys()
                     self._publish_phase(uc_sync, mc_sync, 0)
                     self._sync_phase(
@@ -1692,18 +1653,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 tile_sum = self._block_sum(sum_sq, smem)
                 if tidx == 0:
-                    _red_global_add_f32(
-                        uc_row_partials.iterator + row * self.row_partial_stride,
-                        tile_sum,
+                    _multimem_st_f32(
+                        mc_partials.iterator + row * self.vec_chunks + chunk, tile_sum
                     )
                     _fence_acq_rel_sys()
                     _atom_global_add_i32(uc_sync.iterator + self.phase1_sync_base + 0, Int32(1))
 
                 self._wait_phase(uc_sync, self.phase1_sync_base, phase1_seen)
 
-                row_sum = _multimem_ld_reduce_f32(
-                    mc_row_partials.iterator + row * self.row_partial_stride
-                )
+                row_sum = Float32(0.0)
+                for c in cutlass.range_constexpr(self.vec_chunks):
+                    row_sum += _ld_global_f32(
+                        uc_partials.iterator + row * self.vec_chunks + c
+                    )
                 inv_rms = cute.math.rsqrt(
                     row_sum / Float32(self.hidden_size) + eps,
                     fastmath=True,
@@ -1802,8 +1764,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_addr_residual: Int64,
             uc_addr_weight: Int64,
             mc_addr_output: Int64,
-            mc_addr_row_partials: Int64,
-            uc_addr_row_partials: Int64,
+            mc_addr_partials: Int64,
+            uc_addr_partials: Int64,
             uc_addr_sync: Int64,
             mc_addr_sync: Int64,
             eps: Float32,
@@ -1813,11 +1775,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
             uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
             mc_output = _raw_tensor_1d(mc_addr_output, BFloat16, self.numel * 2)
-            mc_row_partials = _raw_tensor_1d(
-                mc_addr_row_partials, Float32, self.rows * self.row_partial_stride
+            mc_partials = _raw_tensor_1d(
+                mc_addr_partials, Float32, self.rows * self.vec_chunks
             )
-            uc_row_partials = _raw_tensor_1d(
-                uc_addr_row_partials, Float32, self.rows * self.row_partial_stride
+            uc_partials = _raw_tensor_1d(
+                uc_addr_partials, Float32, self.rows * self.vec_chunks
             )
             uc_sync = _raw_tensor_1d(uc_addr_sync, Int32, self.phase_sync_size * 3)
             mc_sync = _raw_tensor_1d(mc_addr_sync, Int32, self.phase_sync_size * 3)
@@ -1827,8 +1789,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 uc_res,
                 uc_w,
                 mc_output,
-                mc_row_partials,
-                uc_row_partials,
+                mc_partials,
+                uc_partials,
                 uc_sync,
                 mc_sync,
                 eps,
@@ -2163,20 +2125,21 @@ def _make_register_tile_fused_twoshot_runtime(
     rows, hidden_size = input_2d.shape
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    vec_chunks = hidden_size // (threads_per_cta * 8)
 
     symm_input = _alloc_symm_tensor(input_2d.numel(), input_2d.dtype)
     symm_output = _alloc_symm_tensor(input_2d.numel() * 2, input_2d.dtype)
-    symm_row_partials = _alloc_symm_tensor(rows, torch.float32)
+    symm_partials = _alloc_symm_tensor(rows * vec_chunks, torch.float32)
     symm_sync = _alloc_symm_tensor((world_size + 2) * 3, torch.int32)
 
     mc_addr_in = symm_input.multicast_ptr
     mc_addr_output = symm_output.multicast_ptr
-    mc_addr_row_partials = symm_row_partials.multicast_ptr
+    mc_addr_partials = symm_partials.multicast_ptr
     mc_addr_sync = symm_sync.multicast_ptr
     if (
         mc_addr_in is None
         or mc_addr_output is None
-        or mc_addr_row_partials is None
+        or mc_addr_partials is None
         or mc_addr_sync is None
     ):
         raise NotImplementedError("symmetric memory multicast pointer is unavailable")
@@ -2194,8 +2157,8 @@ def _make_register_tile_fused_twoshot_runtime(
         Int64(residual_2d.data_ptr()),
         Int64(weight.data_ptr()),
         Int64(mc_addr_output),
-        Int64(mc_addr_row_partials),
-        Int64(symm_row_partials.tensor.data_ptr()),
+        Int64(mc_addr_partials),
+        Int64(symm_partials.tensor.data_ptr()),
         Int64(symm_sync.tensor.data_ptr()),
         Int64(mc_addr_sync),
         Float32(eps),
@@ -2205,7 +2168,7 @@ def _make_register_tile_fused_twoshot_runtime(
     return _RegisterTileFusedTwoShotRuntime(
         symm_input=symm_input,
         symm_output=symm_output,
-        symm_row_partials=symm_row_partials,
+        symm_partials=symm_partials,
         symm_sync=symm_sync,
         launch=launch,
         threads_per_cta=threads_per_cta,
@@ -2385,8 +2348,8 @@ def _launch_register_tile_fused_twoshot(
     residual_2d: torch.Tensor,
     weight: torch.Tensor,
     mc_addr_output: int,
-    mc_addr_row_partials: int,
-    row_partials: torch.Tensor,
+    mc_addr_partials: int,
+    partials: torch.Tensor,
     sync: torch.Tensor,
     mc_addr_sync: int,
     eps: float,
@@ -2396,8 +2359,8 @@ def _launch_register_tile_fused_twoshot(
         Int64(residual_2d.data_ptr()),
         Int64(weight.data_ptr()),
         Int64(mc_addr_output),
-        Int64(mc_addr_row_partials),
-        Int64(row_partials.data_ptr()),
+        Int64(mc_addr_partials),
+        Int64(partials.data_ptr()),
         Int64(sync.data_ptr()),
         Int64(mc_addr_sync),
         Float32(eps),
@@ -3175,15 +3138,15 @@ class FusedAllreduceResidualRmsnormBf16RegisterTileFusedTwoShotDeviceSyncContext
         sync_reference = torch.empty(
             ((world_size + 2) * 3,), dtype=torch.int32, device=reference_2d.device
         )
-        row_partials_reference = torch.empty(
-            (reference_2d.shape[0],),
+        partials_reference = torch.empty(
+            (reference_2d.shape[0], vec_chunks),
             dtype=torch.float32,
             device=reference_2d.device,
         )
         self.sync = allocate_symmetric_tensor_like(sync_reference).view(-1)
-        self.row_partials = allocate_symmetric_tensor_like(row_partials_reference).view(-1)
+        self.partials = allocate_symmetric_tensor_like(partials_reference).view(-1)
         self.sync.zero_()
-        self.row_partials.zero_()
+        self.partials.zero_()
         torch.cuda.synchronize()
 
         _enable_symmetric_memory()
@@ -3199,34 +3162,34 @@ class FusedAllreduceResidualRmsnormBf16RegisterTileFusedTwoShotDeviceSyncContext
 
         symm_input = _lookup_symmetric_input(self.input_2d)
         symm_output = _lookup_symmetric_input(self.output.reshape(-1))
-        symm_row_partials = _lookup_symmetric_input(self.row_partials)
+        symm_partials = _lookup_symmetric_input(self.partials)
         symm_sync = _lookup_symmetric_input(self.sync)
         if (
             symm_input is None
             or symm_output is None
-            or symm_row_partials is None
+            or symm_partials is None
             or symm_sync is None
         ):
             raise RuntimeError("failed to find registered symmetric buffers")
 
         self._symm_input = symm_input
         self._symm_output = symm_output
-        self._symm_row_partials = symm_row_partials
+        self._symm_partials = symm_partials
         self._symm_sync = symm_sync
         mc_addr_in = symm_input.multicast_ptr
         mc_addr_output = symm_output.multicast_ptr
-        mc_addr_row_partials = symm_row_partials.multicast_ptr
+        mc_addr_partials = symm_partials.multicast_ptr
         mc_addr_sync = symm_sync.multicast_ptr
         if (
             mc_addr_in is None
             or mc_addr_output is None
-            or mc_addr_row_partials is None
+            or mc_addr_partials is None
             or mc_addr_sync is None
         ):
             raise NotImplementedError("symmetric memory multicast pointer is unavailable")
         self._mc_addr_in = mc_addr_in
         self._mc_addr_output = mc_addr_output
-        self._mc_addr_row_partials = mc_addr_row_partials
+        self._mc_addr_partials = mc_addr_partials
         self._mc_addr_sync = mc_addr_sync
 
     @property
@@ -3261,8 +3224,8 @@ class FusedAllreduceResidualRmsnormBf16RegisterTileFusedTwoShotDeviceSyncContext
             residual_2d,
             self.weight,
             self._mc_addr_output,
-            self._mc_addr_row_partials,
-            self.row_partials,
+            self._mc_addr_partials,
+            self.partials,
             self.sync,
             self._mc_addr_sync,
             self.eps,
