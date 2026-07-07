@@ -191,28 +191,11 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
-constexpr int kMaxClusterSize = 8;
-
-template <bool UseParallelClusterReduce>
-struct RmsNormSharedStorage;
-
-template <>
-struct RmsNormSharedStorage<false>
-{
-    float scale;
-};
-
-template <>
-struct RmsNormSharedStorage<true>
-{
-    float scale;
-    float blockAcc[kMaxClusterSize];
-};
-
 template <AllReduceFusionPattern Pattern, typename DType, bool UseParallelClusterReduce>
 class FusedOp
 {
     static constexpr int kMathCount = sizeof(float4) / sizeof(DType);
+    static constexpr int kMaxClusterSize = 8;
 
 public:
     __device__ __forceinline__ FusedOp(AllReduceFusionParams const& params, int access_id, int access_id_in_token)
@@ -305,7 +288,7 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ RmsNormSharedStorage<UseParallelClusterReduce> rmsShared;
+        __shared__ float scale;
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -321,6 +304,7 @@ protected:
         {
             if constexpr (UseParallelClusterReduce)
             {
+                __shared__ float blockAcc[kMaxClusterSize];
                 int const blockRank = cluster.block_rank();
                 int const blockNum = cluster.num_blocks();
                 // DSM access requires every block in the cluster to exist concurrently.
@@ -328,7 +312,7 @@ protected:
                 // blockReduceSumV2 broadcasts the block total to every lane in warp 0.
                 if (threadIdx.x < blockNum)
                 {
-                    cluster.map_shared_rank(&rmsShared.blockAcc[0], threadIdx.x)[blockRank] = acc;
+                    cluster.map_shared_rank(&blockAcc[0], threadIdx.x)[blockRank] = acc;
                 }
                 // Complete remote stores before any destination block can exit.
                 cluster.sync();
@@ -337,7 +321,7 @@ protected:
                     acc = 0.f;
                     for (int i = 0; i < blockNum; ++i)
                     {
-                        acc += rmsShared.blockAcc[i];
+                        acc += blockAcc[i];
                     }
                 }
             }
@@ -345,7 +329,7 @@ protected:
             {
                 if (threadIdx.x == 0)
                 {
-                    rmsShared.scale = acc;
+                    scale = acc;
                     acc = 0.f;
                 }
                 cluster.sync();
@@ -353,7 +337,7 @@ protected:
                 {
                     for (int i = 0; i < cluster.num_blocks(); ++i)
                     {
-                        acc += *cluster.map_shared_rank(&rmsShared.scale, i);
+                        acc += *cluster.map_shared_rank(&scale, i);
                     }
                 }
                 cluster.sync();
@@ -362,14 +346,14 @@ protected:
 #endif
         if (threadIdx.x == 0)
         {
-            rmsShared.scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+            scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
         }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * rmsShared.scale
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
