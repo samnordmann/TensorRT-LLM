@@ -191,7 +191,7 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
-template <AllReduceFusionPattern Pattern, typename DType>
+template <AllReduceFusionPattern Pattern, typename DType, bool UseParallelClusterReduce>
 class FusedOp
 {
     static constexpr int kMathCount = sizeof(float4) / sizeof(DType);
@@ -288,10 +288,8 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float scale;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        __shared__ float blockAcc[kMaxClusterSize];
-#endif
+        constexpr int kRmsSharedSize = UseParallelClusterReduce ? kMaxClusterSize : 1;
+        __shared__ float rmsShared[kRmsSharedSize];
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -305,37 +303,57 @@ protected:
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
-            int const blockRank = cluster.block_rank();
-            int const blockNum = cluster.num_blocks();
-            // DSM access requires every block in the cluster to exist concurrently.
-            cluster.sync();
-            // blockReduceSumV2 broadcasts the block total to every lane in warp 0.
-            if (threadIdx.x < blockNum)
+            if constexpr (UseParallelClusterReduce)
             {
-                cluster.map_shared_rank(&blockAcc[0], threadIdx.x)[blockRank] = acc;
-            }
-            // Complete remote stores before any destination block can exit.
-            cluster.sync();
-            if (threadIdx.x == 0)
-            {
-                acc = 0.f;
-                for (int i = 0; i < blockNum; ++i)
+                int const blockRank = cluster.block_rank();
+                int const blockNum = cluster.num_blocks();
+                // DSM access requires every block in the cluster to exist concurrently.
+                cluster.sync();
+                // blockReduceSumV2 broadcasts the block total to every lane in warp 0.
+                if (threadIdx.x < blockNum)
                 {
-                    acc += blockAcc[i];
+                    cluster.map_shared_rank(&rmsShared[0], threadIdx.x)[blockRank] = acc;
                 }
+                // Complete remote stores before any destination block can exit.
+                cluster.sync();
+                if (threadIdx.x == 0)
+                {
+                    acc = 0.f;
+                    for (int i = 0; i < blockNum; ++i)
+                    {
+                        acc += rmsShared[i];
+                    }
+                }
+            }
+            else
+            {
+                if (threadIdx.x == 0)
+                {
+                    rmsShared[0] = acc;
+                    acc = 0.f;
+                }
+                cluster.sync();
+                if (threadIdx.x == 0)
+                {
+                    for (int i = 0; i < cluster.num_blocks(); ++i)
+                    {
+                        acc += *cluster.map_shared_rank(&rmsShared[0], i);
+                    }
+                }
+                cluster.sync();
             }
         }
 #endif
         if (threadIdx.x == 0)
         {
-            scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+            rmsShared[0] = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
         }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * rmsShared[0]
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
@@ -463,7 +481,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
     float4 clear_vec = get_neg_zero();
-    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+    FusedOp<Pattern, DType, false> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -543,7 +561,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     int access_id = index_helper.access_id;
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
-    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+    FusedOp<Pattern, DType, true> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
