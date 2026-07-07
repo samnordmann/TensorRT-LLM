@@ -288,8 +288,10 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float blockAcc[kMaxClusterSize];
         __shared__ float scale;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        __shared__ float blockAcc[kMaxClusterSize];
+#endif
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -305,11 +307,14 @@ protected:
         {
             int const blockRank = cluster.block_rank();
             int const blockNum = cluster.num_blocks();
+            // DSM access requires every block in the cluster to exist concurrently.
+            cluster.sync();
             // blockReduceSumV2 broadcasts the block total to every lane in warp 0.
             if (threadIdx.x < blockNum)
             {
                 cluster.map_shared_rank(&blockAcc[0], threadIdx.x)[blockRank] = acc;
             }
+            // Complete remote stores before any destination block can exit.
             cluster.sync();
             if (threadIdx.x == 0)
             {
